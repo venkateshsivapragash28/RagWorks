@@ -6,17 +6,12 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from fastmcp import FastMCP, tool
 
-# ---- Local imports (assumes proper project structure) ----
 from loader import load_data
 from dtype import get_column_info
-import errors
 
 
-# ---- MCP SERVER ----
 mcp = FastMCP("semantic-dtype-validator")
 
-
-# ---- LLM SETUP ----
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
@@ -26,144 +21,105 @@ llm = ChatGoogleGenerativeAI(
 )
 
 
-# ---- SYSTEM PROMPT ----
-SYSTEM_PROMPT = """
-You are a dataset semantic dtype validation agent.
-
-You will receive column dtype information.
-
-Your task is to determine whether the detected dtype
-matches the semantic meaning of the column name.
-
-Return ONLY JSON.
-
-Allowed semantic types:
-numerical
-categorical
-datetime
-text
-
-Allowed suggested_fix values (STRICT):
-to_numeric
-to_float
-to_int
-to_datetime
-to_category
-to_string
-none
-
-Output schema:
-
-[
- {
-  "column": "<column name>",
-  "semantic_type": "numerical | categorical | datetime | text",
-  "issue": "wrong | correct",
-  "suggested_fix": "<one of the allowed tokens>",
-  "confidence": 0-1,
-  "reason": "<short explanation>"
- }
-]
-
-Rules:
-- suggested_fix MUST be from the allowed tokens only.
-- If dtype is correct → issue="correct", suggested_fix="none"
-- Return a result for EVERY column.
-- Only return valid JSON.
-"""
+SYSTEM_PROMPT = """<KEEP SAME PROMPT>"""
 
 
-# ---- TOOL 1 ----
+# -----------------------------
+# TOOL 1
+# -----------------------------
 @tool
-def validate_semantic_types(dtype_info: dict) -> list:
-    """Validate whether dataset dtypes match semantic expectations."""
+def validate_semantic_types(dtype_info: dict):
+
+    if not isinstance(dtype_info, dict) or not dtype_info:
+        return {"report": [], "error": "Invalid dtype_info"}
 
     prompt = f"""
 Column dtype information:
 
 {json.dumps(dtype_info, indent=2)}
-
-Analyze whether dtype matches the semantic meaning of the column name.
-Return a validation result for EVERY column.
 """
 
-    response = llm.invoke([
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=prompt)
-    ])
-
-    content = response.content.strip()
-    content = content.replace("```json", "").replace("```", "").strip()
-
     try:
+        response = llm.invoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=prompt)
+        ])
+
+        content = response.content.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+
         llm_report = json.loads(content)
 
         if not isinstance(llm_report, list):
-            raise errors.SemanticTypeError(
-                "Semantic type validation output must be a JSON list."
-            )
+            raise ValueError("Not a list")
 
     except Exception as exc:
-        # SAFE fallback instead of crashing MCP
-        return [{
-            "column": "unknown",
-            "semantic_type": "unknown",
-            "issue": "wrong",
-            "suggested_fix": "none",
-            "confidence": 0.0,
-            "reason": f"JSON parsing failed: {str(exc)}"
-        }]
+        return {
+            "report": [],
+            "error": f"LLM parsing failed: {str(exc)}"
+        }
 
-    # ---- Map results ----
-    llm_map = {}
-
-    for item in llm_report:
-        if isinstance(item, dict) and "column" in item:
-            llm_map[item["column"]] = item
+    llm_map = {item["column"]: item for item in llm_report if isinstance(item, dict)}
 
     final_report = []
 
     for column in dtype_info.keys():
 
-        if column in llm_map:
+        item = llm_map.get(column, {
+            "column": column,
+            "semantic_type": "unknown",
+            "issue": "correct",
+            "suggested_fix": "none",
+            "confidence": 1.0,
+            "reason": "no semantic dtype issue detected"
+        })
 
-            item = llm_map[column]
+        item.setdefault("semantic_type", "unknown")
+        item.setdefault("issue", "correct")
+        item.setdefault("suggested_fix", "none")
+        item.setdefault("confidence", 0.9)
+        item.setdefault("reason", "")
 
-            item.setdefault("semantic_type", "unknown")
-            item.setdefault("issue", "correct")
-            item.setdefault("suggested_fix", "none")
-            item.setdefault("confidence", 0.9)
-            item.setdefault("reason", "")
+        final_report.append(item)
 
-            final_report.append(item)
-
-        else:
-
-            final_report.append({
-                "column": column,
-                "semantic_type": "unknown",
-                "issue": "correct",
-                "suggested_fix": "none",
-                "confidence": 1.0,
-                "reason": "no semantic dtype issue detected"
-            })
-
-    return final_report
+    return {"report": final_report}
 
 
-# ---- TOOL 2 ----
+# -----------------------------
+# TOOL 2
+# -----------------------------
 @tool
-def generate_semantic_report(file_path: str) -> list:
-    """Generate a semantic dtype validation report for a dataset file."""
+def generate_semantic_report(file_path: str):
 
-    df = load_data(file_path)[0]
-    dtype_info = get_column_info(df)
+    if not file_path or not isinstance(file_path, str):
+        return {"report": [], "error": "Invalid file_path"}
 
-    report = validate_semantic_types(dtype_info)
+    try:
+        result = load_data(file_path)
+        if not result:
+            return {"report": [], "error": "Failed to load data"}
 
-    return report
+        df = result[0]
+    except Exception as e:
+        return {"report": [], "error": str(e)}
+
+    try:
+        dtype_info = get_column_info(df)
+    except Exception as e:
+        return {"report": [], "error": f"dtype extraction failed: {str(e)}"}
+
+    return validate_semantic_types(dtype_info)
 
 
-# ---- RUN MCP SERVER ----
+# -----------------------------
+# REGISTER TOOLS (explicit)
+# -----------------------------
+mcp.register_tool(validate_semantic_types)
+mcp.register_tool(generate_semantic_report)
+
+
+# -----------------------------
+# RUN
+# -----------------------------
 if __name__ == "__main__":
     mcp.run()
