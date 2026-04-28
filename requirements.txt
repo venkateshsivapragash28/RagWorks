@@ -1,0 +1,7 @@
+fastmcp
+pandas
+numpy
+scipy
+openpyxl
+langchain-core
+langchain-google-genai
